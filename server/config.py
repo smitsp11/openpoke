@@ -58,6 +58,10 @@ class Settings(BaseModel):
     email_classifier_model: str = Field(default="openrouter/free")
     knowledge_graph_model: str = Field(default="openrouter/free")
 
+    deepgram_api_key: str = Field(default=os.getenv("DEEPGRAM_API_KEY"))
+    elevenlabs_api_key: str = Field(default=os.getenv("ELEVENLABS_API_KEY"))
+    elevenlabs_voice_id: str = Field(default="21m00Tcm4TlvDq8ikWAM")
+
     # Credentials / integrations
     openrouter_api_key: Optional[str] = Field(default=os.getenv("OPENROUTER_API_KEY"))
     composio_gmail_auth_config_id: Optional[str] = Field(default=os.getenv("COMPOSIO_GMAIL_AUTH_CONFIG_ID"))

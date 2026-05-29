@@ -21,33 +21,29 @@ def main() -> None:
     parser.add_argument("--reload", action="store_true", help="Enable auto-reload for development")
     args = parser.parse_args()
 
-    # Reduce uvicorn access log noise - only show warnings and errors
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
     logging.getLogger("uvicorn").setLevel(logging.INFO)
-    # Reduce watchfiles noise during development
     logging.getLogger("watchfiles.main").setLevel(logging.WARNING)
-    
+
+    logger = logging.getLogger(__name__)
+    logger.info("Voice WebSocket available at ws://%s:%s/chat/voice", args.host, args.port)
+
+    shared_config = dict(
+        host=args.host,
+        port=args.port,
+        reload=args.reload,
+        log_level="info",
+        access_log=False,
+        ws="websockets",        # explicit WebSocket implementation
+        ws_ping_interval=20,    # keep voice connections alive
+        ws_ping_timeout=30,
+    )
+
     if args.reload:
-        # For reload mode, use import string
-        uvicorn.run(
-            "server.app:app",
-            host=args.host,
-            port=args.port,
-            reload=args.reload,
-            log_level="info",
-            access_log=False,  # Disable access logs completely for cleaner output
-        )
+        uvicorn.run("server.app:app", **shared_config)
     else:
-        # For production mode, use app object directly
-        uvicorn.run(
-            app,
-            host=args.host,
-            port=args.port,
-            reload=args.reload,
-            log_level="info",
-            access_log=False,  # Disable access logs completely for cleaner output
-        )
+        uvicorn.run(app, **shared_config)
 
 
-if __name__ == "__main__":  # pragma: no cover - CLI invocation guard
+if __name__ == "__main__":  # pragma: no cover
     main()

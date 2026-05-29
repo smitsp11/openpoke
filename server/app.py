@@ -14,7 +14,6 @@ from .services import get_important_email_watcher, get_knowledge_graph_watcher, 
 from .services.triggers import get_trigger_service
 
 
-# Register global exception handlers for consistent error responses across the API
 def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(RequestValidationError)
     async def _validation_exception_handler(request: Request, exc: RequestValidationError):
@@ -59,19 +58,17 @@ app.add_middleware(
     allow_origins=_settings.cors_allow_origins,
     allow_credentials=False,
     allow_methods=["*"],
-    allow_headers=["*"],
+    # Upgrade + Connection are required for the WebSocket handshake to pass
+    # through CORS preflight checks without being stripped
+    allow_headers=["*", "Upgrade", "Connection"],
 )
 
 register_exception_handlers(app)
 app.include_router(api_router)
 
 
-_CLAIM_VERIFIER_AGENT = "claim-verifier"
-
-# Every 6 hours. Balances freshness against LLM cost: at ~10 LLM calls per run
-# (one execution agent turn evaluating 10 claims), 4 runs/day = ~40 assessments/day.
-_CLAIM_VERIFIER_RRULE = "FREQ=HOURLY;INTERVAL=6"
-
+_CLAIM_VERIFIER_AGENT   = "claim-verifier"
+_CLAIM_VERIFIER_RRULE   = "FREQ=HOURLY;INTERVAL=6"
 _CLAIM_VERIFIER_PAYLOAD = (
     "Run the periodic claim verification pass.\n\n"
     "Evaluate pending newsletter claims against available evidence in the knowledge "
@@ -84,13 +81,8 @@ _CLAIM_VERIFIER_PAYLOAD = (
 
 
 def _bootstrap_claim_verifier_trigger() -> None:
-    """Ensure the claim-verifier trigger exists and is active.
-
-    Idempotent: if an active trigger already exists for this agent, this is a
-    no-op. Called synchronously from the startup event before the scheduler
-    starts so the trigger is visible on the first poll.
-    """
-    service = get_trigger_service()
+    """Ensure the claim-verifier trigger exists and is active. Idempotent."""
+    service  = get_trigger_service()
     existing = service.list_triggers(agent_name=_CLAIM_VERIFIER_AGENT)
     non_completed = [t for t in existing if t.status != "completed"]
     if non_completed:
@@ -113,24 +105,32 @@ def _bootstrap_claim_verifier_trigger() -> None:
 
 
 @app.on_event("startup")
-# Initialize background services (trigger scheduler, email watcher, KG watcher) when the app starts
-async def _start_trigger_scheduler() -> None:
+async def _on_startup() -> None:
     _bootstrap_claim_verifier_trigger()
+
     scheduler = get_trigger_scheduler()
     await scheduler.start()
+
     watcher = get_important_email_watcher()
     await watcher.start()
+
     kg_watcher = get_knowledge_graph_watcher()
     await kg_watcher.start()
 
+    # Confirm voice endpoint is registered and reachable
+    host = _settings.server_host
+    port = _settings.server_port
+    logger.info("Voice WebSocket endpoint ready at ws://%s:%s/api/v1/chat/voice", host, port)
+
 
 @app.on_event("shutdown")
-# Gracefully shutdown background services when the app stops
-async def _stop_trigger_scheduler() -> None:
+async def _on_shutdown() -> None:
     scheduler = get_trigger_scheduler()
     await scheduler.stop()
+
     watcher = get_important_email_watcher()
     await watcher.stop()
+
     kg_watcher = get_knowledge_graph_watcher()
     await kg_watcher.stop()
 
