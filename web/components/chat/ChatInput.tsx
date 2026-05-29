@@ -214,6 +214,15 @@ export function ChatInput({
           // Attempt to advance the queue (no-op if this chunk isn't next)
           playQueue();
         }
+        if (frame.type === "audio_chunk_skip") {
+          // Server skipped this index (nothing speakable) — advance past it
+          // so the queue doesn't stall waiting for a chunk that will never arrive
+          const skipped = frame.index as number;
+          if (skipped === nextIndexRef.current) {
+            nextIndexRef.current++;
+            playQueue(); // try to advance to the next real chunk
+          }
+        }
 
         // ── Barge-in acknowledged by server ──
         if (frame.type === "barge_in_ack") {

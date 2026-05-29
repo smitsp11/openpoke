@@ -2,6 +2,8 @@ from fastapi import APIRouter
 import re
 from fastapi.responses import JSONResponse
 import asyncio
+from ..utils.tts_sanitizer import sanitize_for_tts
+
 
 
 
@@ -171,8 +173,18 @@ async def voice_chat(ws: WebSocket):
     tts_tasks: list[asyncio.Task] = []
 
     async def tts_and_send(sentence: str, index: int) -> None:
+        clean = sanitize_for_tts(sentence)
+        if not clean:
+            # Nothing speakable — skip this chunk entirely,
+            # but still send a silent placeholder so the client
+            # index sequence stays contiguous
+            await ws.send_text(json.dumps({
+                "type":  "audio_chunk_skip",
+                "index": index,
+            }))
+            return
         try:
-            mp3      = await synthesize_speech(sentence)
+            mp3       = await synthesize_speech(clean)
             audio_b64 = base64.b64encode(mp3).decode()
             await ws.send_text(json.dumps({
                 "type":  "audio_chunk",
@@ -183,38 +195,6 @@ async def voice_chat(ws: WebSocket):
             raise
         except Exception as e:
             await ws.send_text(json.dumps({"type": "error", "message": f"TTS failed: {e}"}))
-
-    try:
-        async for token in client.stream_completion(
-            messages=[{"role": "user", "content": transcript}]
-        ):
-            buffer += token
-            # Stream token to client for live text display
-            await ws.send_text(json.dumps({"type": "text_chunk", "text": token}))
-
-            # Flush complete sentences to TTS immediately
-            parts = _SENTENCE_END.split(buffer)
-            if len(parts) > 1:
-                for sentence in parts[:-1]:
-                    if sentence.strip():
-                        tts_tasks.append(asyncio.create_task(tts_and_send(sentence, chunk_index)))
-                        chunk_index += 1
-                buffer = parts[-1]
-
-        # Flush any remaining buffer
-        if buffer.strip():
-            tts_tasks.append(asyncio.create_task(tts_and_send(buffer, chunk_index)))
-
-        await ws.send_text(json.dumps({"type": "text_done"}))
-        await asyncio.gather(*tts_tasks)
-
-    except asyncio.CancelledError:
-        for t in tts_tasks:
-            t.cancel()
-        raise
-    except WebSocketDisconnect:
-        if pipeline_task and not pipeline_task.done():
-            pipeline_task.cancel()
 
 
 # ── Existing REST endpoints (unchanged) ──────────────────────────────────────
