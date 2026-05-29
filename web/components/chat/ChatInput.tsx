@@ -11,10 +11,13 @@ interface ChatInputProps {
   onChange: (value: string) => void;
   onSubmit: () => Promise<void> | void;
   voiceWsUrl?: string;
-  onVoiceReply?: (text: string) => void;
   onVoiceStateChange?: (state: VoiceState) => void;
   onLiveTranscript?: (transcript: string) => void;
   onBargein?: () => void;
+  /** Called for each incremental token as the LLM streams */
+  onTextChunk?: (chunk: string) => void;
+  /** Called once the full LLM response is complete */
+  onTextDone?: () => void;
 }
 
 export function ChatInput({
@@ -23,29 +26,39 @@ export function ChatInput({
   placeholder,
   onChange,
   onSubmit,
-  voiceWsUrl = "ws://localhost:8000/chat/voice",
-  onVoiceReply,
+  voiceWsUrl = "ws://localhost:3000/api/chat",
   onVoiceStateChange,
   onLiveTranscript,
-  onBargein,          // ← was missing from destructuring
+  onBargein,
+  onTextChunk,
+  onTextDone,
 }: ChatInputProps) {
   const [voiceState, setVoiceState]     = useState<VoiceState>("idle");
   const [transcript, setTranscript]     = useState<string>("");
   const [voiceError, setVoiceError]     = useState<string>("");
   const [vadThreshold, setVadThreshold] = useState(0.015);
 
+  // ── Refs ───────────────────────────────────────────────────────────────────
   const wsRef              = useRef<WebSocket | null>(null);
   const mediaRecorderRef   = useRef<MediaRecorder | null>(null);
   const audioContextRef    = useRef<AudioContext | null>(null);
   const analyserRef        = useRef<AnalyserNode | null>(null);
   const animFrameRef       = useRef<number>(0);
   const canvasRef          = useRef<HTMLCanvasElement>(null);
+
+  // VAD refs
   const vadAudioContextRef = useRef<AudioContext | null>(null);
   const vadAnalyserRef     = useRef<AnalyserNode | null>(null);
   const vadFrameRef        = useRef<number>(0);
-  const activeAudioRef     = useRef<HTMLAudioElement | null>(null);
-  // Stable ref so startVAD can call handleBargein without a circular dep
-  const handleBargeinRef   = useRef<() => void>(() => {});
+
+  // Audio queue refs — ordered playback of streamed TTS chunks
+  const activeAudioRef  = useRef<HTMLAudioElement | null>(null);
+  const audioQueueRef   = useRef<Map<number, string>>(new Map()); // index → base64
+  const nextIndexRef    = useRef<number>(0);
+  const isPlayingRef    = useRef<boolean>(false);
+
+  // Stable ref so startVAD can call handleBargein without circular dep
+  const handleBargeinRef = useRef<() => void>(() => {});
 
   // ── Stable wrappers ────────────────────────────────────────────────────────
 
@@ -89,6 +102,42 @@ export function ChatInput({
     animFrameRef.current = requestAnimationFrame(drawWaveform);
   }, []);
 
+  // ── Audio queue playback ───────────────────────────────────────────────────
+
+  const playQueue = useCallback(() => {
+    // Already playing or nothing queued at the next expected index
+    if (isPlayingRef.current) return;
+    const data = audioQueueRef.current.get(nextIndexRef.current);
+    if (!data) return;
+
+    isPlayingRef.current = true;
+    const mp3   = Uint8Array.from(atob(data), (c) => c.charCodeAt(0));
+    const blob  = new Blob([mp3], { type: "audio/mpeg" });
+    const url   = URL.createObjectURL(blob);
+    const audio = new Audio(url);
+    activeAudioRef.current = audio;
+
+    audio.onended = () => {
+      URL.revokeObjectURL(url);
+      audioQueueRef.current.delete(nextIndexRef.current);
+      nextIndexRef.current++;
+      isPlayingRef.current   = false;
+      activeAudioRef.current = null;
+
+      if (audioQueueRef.current.size === 0) {
+        // Queue fully drained — return to idle
+        updateVoiceState("idle");
+        updateTranscript("");
+        stopVAD();
+      } else {
+        // Advance to the next chunk
+        playQueue();
+      }
+    };
+
+    audio.play().catch(() => {});
+  }, [updateVoiceState, updateTranscript]); // stopVAD added after definition below
+
   // ── VAD ────────────────────────────────────────────────────────────────────
 
   const stopVAD = useCallback(() => {
@@ -107,14 +156,13 @@ export function ChatInput({
     vadAudioContextRef.current = ac;
     vadAnalyserRef.current     = analyser;
 
-    const buf = new Uint8Array(analyser.frequencyBinCount);
+    const buf  = new Uint8Array(analyser.frequencyBinCount);
     const poll = () => {
       analyser.getByteTimeDomainData(buf);
       const rms = Math.sqrt(
         buf.reduce((s, v) => s + ((v - 128) / 128) ** 2, 0) / buf.length
       );
       if (rms > vadThreshold) {
-        // Call through the ref to avoid circular dependency
         handleBargeinRef.current();
         return;
       }
@@ -134,38 +182,45 @@ export function ChatInput({
       ws.onmessage = async (event) => {
         const frame = JSON.parse(event.data as string);
 
+        // ── STT transcript ──
         if (frame.type === "transcript") {
           updateTranscript(frame.text as string);
         }
 
-        if (frame.type === "text" && onVoiceReply) {
-          onVoiceReply(frame.text as string);
+        // ── Streaming LLM token ──
+        if (frame.type === "text_chunk") {
+          onTextChunk?.(frame.text as string);
         }
 
-        if (frame.type === "audio") {
-          updateVoiceState("speaking");
-          const mp3   = Uint8Array.from(atob(frame.data as string), (c) => c.charCodeAt(0));
-          const blob  = new Blob([mp3], { type: "audio/mpeg" });
-          const url   = URL.createObjectURL(blob);
-          const audio = new Audio(url);
-          activeAudioRef.current = audio;
-
-          navigator.mediaDevices.getUserMedia({ audio: true }).then(startVAD).catch(() => {});
-
-          audio.onended = () => {
-            URL.revokeObjectURL(url);
-            stopVAD();
-            activeAudioRef.current = null;
+        // ── LLM response complete ──
+        if (frame.type === "text_done") {
+          onTextDone?.();
+          // If queue already drained before text_done arrived, go idle now
+          if (audioQueueRef.current.size === 0 && !isPlayingRef.current) {
             updateVoiceState("idle");
             updateTranscript("");
-          };
-          await audio.play();
+          }
         }
 
+        // ── Ordered TTS chunk ──
+        if (frame.type === "audio_chunk") {
+          updateVoiceState("speaking");
+          audioQueueRef.current.set(frame.index as number, frame.data as string);
+          // Start VAD monitoring once audio begins arriving
+          navigator.mediaDevices
+            .getUserMedia({ audio: true })
+            .then(startVAD)
+            .catch(() => {});
+          // Attempt to advance the queue (no-op if this chunk isn't next)
+          playQueue();
+        }
+
+        // ── Barge-in acknowledged by server ──
         if (frame.type === "barge_in_ack") {
           updateTranscript("");
         }
 
+        // ── Error ──
         if (frame.type === "error") {
           setVoiceError(frame.message as string);
           updateVoiceState("idle");
@@ -174,13 +229,18 @@ export function ChatInput({
 
       wsRef.current = ws;
     });
-  }, [voiceWsUrl, onVoiceReply, updateVoiceState, updateTranscript, startVAD, stopVAD]);
+  }, [voiceWsUrl, updateVoiceState, updateTranscript, startVAD, playQueue, onTextChunk, onTextDone]);
 
   // ── Recording ──────────────────────────────────────────────────────────────
 
   const startRecording = useCallback(async () => {
     setVoiceError("");
     updateTranscript("");
+
+    // Reset audio queue state for new utterance
+    audioQueueRef.current.clear();
+    nextIndexRef.current = 0;
+    isPlayingRef.current = false;
 
     try {
       const stream   = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -234,15 +294,23 @@ export function ChatInput({
     }
   }, [stopVAD, updateVoiceState]);
 
-  // ── Barge-in — defined after startRecording, exposed via ref to startVAD ──
+  // ── Barge-in ───────────────────────────────────────────────────────────────
 
   const handleBargein = useCallback(() => {
+    // Stop current playback immediately
     if (activeAudioRef.current) {
       activeAudioRef.current.pause();
       activeAudioRef.current = null;
     }
+
+    // Flush the entire audio queue
+    audioQueueRef.current.clear();
+    nextIndexRef.current = 0;
+    isPlayingRef.current = false;
+
     stopVAD();
 
+    // Tell the server to cancel the in-flight pipeline
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ type: "barge_in" }));
     }
@@ -250,10 +318,11 @@ export function ChatInput({
     updateVoiceState("interrupted");
     onBargein?.();
 
+    // Brief visual pause then flip straight into recording
     setTimeout(() => void startRecording(), 300);
   }, [stopVAD, updateVoiceState, onBargein, startRecording]);
 
-  // Keep the ref in sync so startVAD always calls the latest version
+  // Keep bargein ref in sync so startVAD always calls the latest closure
   useEffect(() => {
     handleBargeinRef.current = handleBargein;
   }, [handleBargein]);
@@ -265,7 +334,7 @@ export function ChatInput({
     else if (voiceState === "idle") void startRecording();
   }, [voiceState, startRecording, stopRecording]);
 
-  // ── Cleanup ────────────────────────────────────────────────────────────────
+  // ── Cleanup on unmount ─────────────────────────────────────────────────────
 
   useEffect(() => {
     return () => {
@@ -273,7 +342,11 @@ export function ChatInput({
       wsRef.current?.close();
       audioContextRef.current?.close();
       stopVAD();
-      activeAudioRef.current?.pause();
+      if (activeAudioRef.current) {
+        activeAudioRef.current.pause();
+        activeAudioRef.current = null;
+      }
+      audioQueueRef.current.clear();
     };
   }, [stopVAD]);
 
@@ -290,9 +363,9 @@ export function ChatInput({
   // ── JSX ────────────────────────────────────────────────────────────────────
 
   return (
-    <div className="flex flex-col gap-2">   {/* ← single root element */}
+    <div className="flex flex-col gap-2">
 
-      {/* Sensitivity slider — always visible */}
+      {/* Sensitivity slider */}
       <div className="flex items-center gap-2 px-1">
         <span className="text-xs text-neutral-500">Sensitivity</span>
         <input

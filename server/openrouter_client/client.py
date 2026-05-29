@@ -87,5 +87,26 @@ async def request_chat_completion(
 
     raise OpenRouterError("OpenRouter request failed: unknown error")
 
+async def stream_completion(self, messages: list[dict], **kwargs) -> AsyncIterator[str]:
+    """Yield tokens from a streaming chat completion."""
+    async with httpx.AsyncClient() as client:
+        async with client.stream(
+            "POST",
+            f"{self.base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            json={"model": self.model, "messages": messages, "stream": True, **kwargs},
+            timeout=60,
+        ) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                data = line[6:]
+                if data == "[DONE]":
+                    return
+                chunk = json.loads(data)
+                token = chunk["choices"][0]["delta"].get("content", "")
+                if token:
+                    yield token
 
 __all__ = ["OpenRouterError", "request_chat_completion", "OpenRouterBaseURL"]

@@ -1,13 +1,18 @@
 from fastapi import APIRouter
+import re
 from fastapi.responses import JSONResponse
 import asyncio
 
 
+
+from ..openrouter_client import get_openrouter_client
 from ..models import ChatHistoryClearResponse, ChatHistoryResponse, ChatRequest
 from ..services import get_conversation_log, get_trigger_service, handle_chat_request
 from ..services.execution.hot_cache import reset_session_cache
 
 router = APIRouter(prefix="/chat", tags=["chat"])
+
+
 
 
 @router.post("/send", response_class=JSONResponse, summary="Submit a chat message and receive a completion")
@@ -148,41 +153,65 @@ async def voice_chat(ws: WebSocket):
                 audio_bytes = b"".join(audio_buffer)
                 audio_buffer.clear()
 
-                async def run_pipeline(audio: bytes) -> None:
-                    try:
-                        transcript = await transcribe_audio(audio)
-                    except Exception as e:
-                        await ws.send_text(json.dumps({"type": "error", "message": f"STT failed: {e}"}))
-                        return
+                async def run_pipeline(audio: bytes, ws: WebSocket) -> None:
+    # 1. STT — unchanged
+    try:
+        transcript = await transcribe_audio(audio)
+    except Exception as e:
+        await ws.send_text(json.dumps({"type": "error", "message": f"STT failed: {e}"}))
+        return
+    if not transcript.strip():
+        return
+    await ws.send_text(json.dumps({"type": "transcript", "text": transcript}))
 
-                    if not transcript.strip():
-                        return
+    # 2. Stream LLM tokens, buffer into sentences, fire TTS per sentence
+    client      = get_openrouter_client()
+    buffer      = ""
+    chunk_index = 0
+    tts_tasks: list[asyncio.Task] = []
 
-                    await ws.send_text(json.dumps({"type": "transcript", "text": transcript}))
+    async def tts_and_send(sentence: str, index: int) -> None:
+        try:
+            mp3      = await synthesize_speech(sentence)
+            audio_b64 = base64.b64encode(mp3).decode()
+            await ws.send_text(json.dumps({
+                "type":  "audio_chunk",
+                "data":  audio_b64,
+                "index": index,
+            }))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            await ws.send_text(json.dumps({"type": "error", "message": f"TTS failed: {e}"}))
 
-                    try:
-                        response    = await handle_chat_request(ChatRequest(message=transcript))
-                        reply_data  = json.loads(response.body.decode())
-                        agent_text  = reply_data.get("message") or reply_data.get("content", "")
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as e:
-                        await ws.send_text(json.dumps({"type": "error", "message": f"Agent failed: {e}"}))
-                        return
+    try:
+        async for token in client.stream_completion(
+            messages=[{"role": "user", "content": transcript}]
+        ):
+            buffer += token
+            # Stream token to client for live text display
+            await ws.send_text(json.dumps({"type": "text_chunk", "text": token}))
 
-                    await ws.send_text(json.dumps({"type": "text", "text": agent_text}))
+            # Flush complete sentences to TTS immediately
+            parts = _SENTENCE_END.split(buffer)
+            if len(parts) > 1:
+                for sentence in parts[:-1]:
+                    if sentence.strip():
+                        tts_tasks.append(asyncio.create_task(tts_and_send(sentence, chunk_index)))
+                        chunk_index += 1
+                buffer = parts[-1]
 
-                    try:
-                        mp3_bytes  = await synthesize_speech(agent_text)
-                        audio_b64  = base64.b64encode(mp3_bytes).decode()
-                        await ws.send_text(json.dumps({"type": "audio", "data": audio_b64}))
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as e:
-                        await ws.send_text(json.dumps({"type": "error", "message": f"TTS failed: {e}"}))
+        # Flush any remaining buffer
+        if buffer.strip():
+            tts_tasks.append(asyncio.create_task(tts_and_send(buffer, chunk_index)))
 
-                pipeline_task = asyncio.create_task(run_pipeline(audio_bytes))
+        await ws.send_text(json.dumps({"type": "text_done"}))
+        await asyncio.gather(*tts_tasks)
 
+    except asyncio.CancelledError:
+        for t in tts_tasks:
+            t.cancel()
+        raise
     except WebSocketDisconnect:
         if pipeline_task and not pipeline_task.done():
             pipeline_task.cancel()

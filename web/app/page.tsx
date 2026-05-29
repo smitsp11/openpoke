@@ -82,6 +82,27 @@ export default function Page() {
     }
   }, []);
 
+  const handleTextChunk = useCallback((chunk: string) => {
+    setMessages(prev => {
+      const last = prev[prev.length - 1];
+      // If the last bubble is an in-progress voice bubble, append to it
+      if (last?.role === 'assistant' && last?.isVoice && !last?.interrupted) {
+        return [
+          ...prev.slice(0, -1),
+          { ...last, text: last.text + chunk },
+        ];
+      }
+      // Otherwise create a new one
+      const id = `voice-assistant-${Date.now()}`;
+      lastVoiceBubbleIdRef.current = id;
+      return [...prev, { id, role: 'assistant', text: chunk, isVoice: true, interrupted: false }];
+    });
+  }, []);
+
+  const handleTextDone = useCallback(() => {
+    void loadHistory();
+  }, [loadHistory]);
+
   useEffect(() => { void loadHistory(); }, [loadHistory]);
 
   useEffect(() => {
@@ -249,7 +270,8 @@ export default function Page() {
               onChange={setInput}
               onSubmit={handleSubmit}
               voiceWsUrl={VOICE_WS_URL}
-              onVoiceReply={handleVoiceReply}
+              onTextChunk={handleTextChunk}
+              onTextDone={handleTextDone}
               onVoiceStateChange={setVoiceState}
               onLiveTranscript={setLiveTranscript}
               onBargein={handleBargein}
