@@ -3,7 +3,7 @@ import { RefObject } from 'react';
 
 import type { ChatBubble } from './types';
 
-type VoiceState = 'idle' | 'recording' | 'processing' | 'speaking';
+type VoiceState = "idle" | "recording" | "processing" | "speaking" | "interrupted";
 
 interface ChatMessagesProps {
   messages: ReadonlyArray<ChatBubble>;
@@ -51,9 +51,11 @@ export function ChatMessages({
             >
               {/* Voice badge on assistant messages */}
               {!isUser && message.isVoice && (
-                <span className="mb-1 flex items-center gap-1 text-[10px] font-medium uppercase tracking-widest text-violet-400">
+                <span className={`mb-1 flex items-center gap-1 text-[10px] font-medium uppercase tracking-widest ${
+                  message.interrupted ? "text-amber-400" : "text-violet-400"
+                }`}>
                   <SpeakerIcon className="h-3 w-3" />
-                  voice
+                  {message.interrupted ? "interrupted" : "voice"}
                 </span>
               )}
               <span className={isDraft ? 'block whitespace-pre-wrap' : 'whitespace-pre-wrap'}>
@@ -77,6 +79,7 @@ export function ChatMessages({
       {/* Voice pipeline state banners */}
       {voiceState === 'processing' && <ProcessingIndicator />}
       {voiceState === 'speaking' && <SpeakingIndicator />}
+      {voiceState === "interrupted" && <InterruptedIndicator />}
 
       {/* Fallback text typing indicator (non-voice wait) */}
       {isWaitingForResponse && voiceState === 'idle' && <TypingIndicator />}
@@ -95,6 +98,16 @@ function ProcessingIndicator() {
           <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
         </svg>
         <span className="text-sm text-gray-400">Thinking…</span>
+      </div>
+    </div>
+  );
+}
+function InterruptedIndicator() {
+  return (
+    <div className="flex justify-start">
+      <div className="bubble-in bubble-tail-in flex items-center gap-2">
+        <span className="text-sm text-amber-400">↩</span>
+        <span className="text-sm text-gray-400 italic">interrupted</span>
       </div>
     </div>
   );

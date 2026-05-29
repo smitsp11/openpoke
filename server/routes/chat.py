@@ -1,5 +1,7 @@
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
+import asyncio
+
 
 from ..models import ChatHistoryClearResponse, ChatHistoryResponse, ChatRequest
 from ..services import get_conversation_log, get_trigger_service, handle_chat_request
@@ -119,6 +121,8 @@ async def voice_chat(ws: WebSocket):
     await ws.accept()
     audio_buffer: list[bytes] = []
 
+    pipeline_task: asyncio.Task | None = None
+
     try:
         while True:
             raw = await ws.receive_text()
@@ -127,6 +131,16 @@ async def voice_chat(ws: WebSocket):
             if frame["type"] == "audio":
                 audio_buffer.append(base64.b64decode(frame["data"]))
 
+            elif frame["type"] == "barge_in":
+                if pipeline_task and not pipeline_task.done():
+                    pipeline_task.cancel()
+                    try:
+                        await pipeline_task
+                    except asyncio.CancelledError:
+                        pass
+                audio_buffer.clear()
+                await ws.send_text(json.dumps({"type": "barge_in_ack"}))
+
             elif frame["type"] == "commit":
                 if not audio_buffer:
                     continue
@@ -134,41 +148,44 @@ async def voice_chat(ws: WebSocket):
                 audio_bytes = b"".join(audio_buffer)
                 audio_buffer.clear()
 
-                # 1. Speech → Text
-                try:
-                    transcript = await transcribe_audio(audio_bytes)
-                except Exception as e:
-                    await ws.send_text(json.dumps({"type": "error", "message": f"STT failed: {e}"}))
-                    continue
+                async def run_pipeline(audio: bytes) -> None:
+                    try:
+                        transcript = await transcribe_audio(audio)
+                    except Exception as e:
+                        await ws.send_text(json.dumps({"type": "error", "message": f"STT failed: {e}"}))
+                        return
 
-                if not transcript.strip():
-                    continue
+                    if not transcript.strip():
+                        return
 
-                await ws.send_text(json.dumps({"type": "transcript", "text": transcript}))
+                    await ws.send_text(json.dumps({"type": "transcript", "text": transcript}))
 
-                # 2. Text → Agent
-                try:
-                    response = await handle_chat_request(ChatRequest(message=transcript))
-                    reply_text = response.body.decode()          # JSONResponse → str
-                    reply_data = json.loads(reply_text)
-                    agent_text = reply_data.get("message") or reply_data.get("content", "")
-                except Exception as e:
-                    await ws.send_text(json.dumps({"type": "error", "message": f"Agent failed: {e}"}))
-                    continue
+                    try:
+                        response    = await handle_chat_request(ChatRequest(message=transcript))
+                        reply_data  = json.loads(response.body.decode())
+                        agent_text  = reply_data.get("message") or reply_data.get("content", "")
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        await ws.send_text(json.dumps({"type": "error", "message": f"Agent failed: {e}"}))
+                        return
 
-                await ws.send_text(json.dumps({"type": "text", "text": agent_text}))
+                    await ws.send_text(json.dumps({"type": "text", "text": agent_text}))
 
-                # 3. Text → Speech
-                try:
-                    mp3_bytes = await synthesize_speech(agent_text)
-                    audio_b64 = base64.b64encode(mp3_bytes).decode()
-                    await ws.send_text(json.dumps({"type": "audio", "data": audio_b64}))
-                except Exception as e:
-                    # TTS failure is non-fatal; client can render text fallback
-                    await ws.send_text(json.dumps({"type": "error", "message": f"TTS failed: {e}"}))
+                    try:
+                        mp3_bytes  = await synthesize_speech(agent_text)
+                        audio_b64  = base64.b64encode(mp3_bytes).decode()
+                        await ws.send_text(json.dumps({"type": "audio", "data": audio_b64}))
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        await ws.send_text(json.dumps({"type": "error", "message": f"TTS failed: {e}"}))
+
+                pipeline_task = asyncio.create_task(run_pipeline(audio_bytes))
 
     except WebSocketDisconnect:
-        pass
+        if pipeline_task and not pipeline_task.done():
+            pipeline_task.cancel()
 
 
 # ── Existing REST endpoints (unchanged) ──────────────────────────────────────

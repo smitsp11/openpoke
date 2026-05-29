@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import SettingsModal, { useSettings } from '@/components/SettingsModal';
 import { ChatHeader } from '@/components/chat/ChatHeader';
 import { ChatInput } from '@/components/chat/ChatInput';
@@ -11,13 +11,16 @@ import type { ChatBubble } from '@/components/chat/types';
 
 const POLL_INTERVAL_MS = 1500;
 
-const formatEscapeCharacters = (text: string): string => {
-  return text
+type VoiceState = 'idle' | 'recording' | 'processing' | 'speaking' | 'interrupted';
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+const formatEscapeCharacters = (text: string): string =>
+  text
     .replace(/\\n/g, '\n')
     .replace(/\\t/g, '\t')
     .replace(/\\r/g, '\r')
     .replace(/\\\\/g, '\\');
-};
 
 const isRenderableMessage = (entry: any) =>
   typeof entry?.role === 'string' &&
@@ -26,29 +29,46 @@ const isRenderableMessage = (entry: any) =>
 
 const toBubbles = (payload: any): ChatBubble[] => {
   if (!Array.isArray(payload?.messages)) return [];
-
   return payload.messages
     .filter(isRenderableMessage)
     .map((message: any, index: number) => ({
-      id: `history-${index}`,
+      id:   `history-${index}`,
       role: message.role,
       text: formatEscapeCharacters(message.content),
     }));
 };
 
+// ── Voice WebSocket URL ───────────────────────────────────────────────────────
+
+const VOICE_WS_URL =
+  typeof window !== 'undefined'
+    ? `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/api/chat`
+    : 'ws://localhost:3000/api/chat';
+
+// ── Page ──────────────────────────────────────────────────────────────────────
+
 export default function Page() {
   const { settings, setSettings } = useSettings();
-  const [open, setOpen] = useState(false);
-  const [input, setInput] = useState('');
-  const [messages, setMessages] = useState<ChatBubble[]>([]);
-  const [error, setError] = useState<string | null>(null);
-  const [isWaitingForResponse, setIsWaitingForResponse] = useState(false);
+  const [open, setOpen]                      = useState(false);
+  const [input, setInput]                    = useState('');
+  const [messages, setMessages]              = useState<ChatBubble[]>([]);
+  const [error, setError]                    = useState<string | null>(null);
+  const [isWaitingForResponse, setIsWaiting] = useState(false);
+  const [voiceState, setVoiceState]          = useState<VoiceState>('idle');
+  const [liveTranscript, setLiveTranscript]  = useState('');
+
+  // Track the id of the last assistant voice bubble so barge-in can flag it
+  const lastVoiceBubbleIdRef = useRef<string | null>(null);
+
   const { scrollContainerRef, handleScroll } = useAutoScroll({
-    items: messages,
+    items:     messages,
     isWaiting: isWaitingForResponse,
   });
-  const openSettings = useCallback(() => setOpen(true), [setOpen]);
-  const closeSettings = useCallback(() => setOpen(false), [setOpen]);
+
+  const openSettings  = useCallback(() => setOpen(true),  []);
+  const closeSettings = useCallback(() => setOpen(false), []);
+
+  // ── History ──────────────────────────────────────────────────────────────
 
   const loadHistory = useCallback(async () => {
     try {
@@ -62,175 +82,152 @@ export default function Page() {
     }
   }, []);
 
+  useEffect(() => { void loadHistory(); }, [loadHistory]);
+
   useEffect(() => {
+    const id = window.setInterval(() => void loadHistory(), POLL_INTERVAL_MS);
+    return () => window.clearInterval(id);
+  }, [loadHistory]);
+
+  // ── Timezone detection ────────────────────────────────────────────────────
+
+  useEffect(() => {
+    const detect = async () => {
+      if (settings.timezone) return;
+      try {
+        const tz  = Intl.DateTimeFormat().resolvedOptions().timeZone;
+        const res = await fetch('/api/timezone', {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ timezone: tz }),
+        });
+        if (res.ok) setSettings({ ...settings, timezone: tz });
+      } catch { /* non-critical */ }
+    };
+    void detect();
+  }, [settings, setSettings]);
+
+  // ── Text send ─────────────────────────────────────────────────────────────
+
+  const sendMessage = useCallback(async (text: string) => {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+
+    setError(null);
+    setIsWaiting(true);
+
+    const userBubble: ChatBubble = {
+      id:   `user-${Date.now()}`,
+      role: 'user',
+      text: formatEscapeCharacters(trimmed),
+    };
+    setMessages(prev => [...prev, userBubble]);
+
+    try {
+      const res = await fetch('/api/chat', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ messages: [{ role: 'user', content: trimmed }] }),
+      });
+      if (!(res.ok || res.status === 202)) {
+        throw new Error((await res.text()) || `Request failed (${res.status})`);
+      }
+    } catch (err: any) {
+      console.error('Failed to send message', err);
+      setError(err?.message || 'Failed to send message');
+      setMessages(prev => prev.filter(m => m.id !== userBubble.id));
+      setIsWaiting(false);
+      throw err instanceof Error ? err : new Error('Failed to send message');
+    } finally {
+      let attempts = 0;
+      const poll = async () => {
+        attempts++;
+        try {
+          const res = await fetch('/api/chat/history', { cache: 'no-store' });
+          if (res.ok) {
+            const current = toBubbles(await res.json());
+            const last    = current[current.length - 1];
+            const hasUser = current.some(m => m.text === trimmed && m.role === 'user');
+            if (last?.role === 'assistant' && hasUser) {
+              setMessages(current);
+              setIsWaiting(false);
+              return;
+            }
+          }
+        } catch { /* swallow poll errors */ }
+        if (attempts < 30) setTimeout(poll, 1000);
+        else { setIsWaiting(false); void loadHistory(); }
+      };
+      setTimeout(poll, 1000);
+    }
+  }, [loadHistory]);
+
+  // ── Voice reply ───────────────────────────────────────────────────────────
+
+  const handleVoiceReply = useCallback((text: string) => {
+    const id = `voice-assistant-${Date.now()}`;
+    lastVoiceBubbleIdRef.current = id;
+
+    setMessages(prev => [
+      ...prev,
+      {
+        id,
+        role:        'assistant',
+        text:        formatEscapeCharacters(text),
+        isVoice:     true,
+        interrupted: false,
+      } satisfies ChatBubble,
+    ]);
     void loadHistory();
   }, [loadHistory]);
 
-  // Detect and store browser timezone on first load
-  useEffect(() => {
-    const detectAndStoreTimezone = async () => {
-      // Only run if timezone not already stored
-      if (settings.timezone) return;
-      
-      try {
-        const browserTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-        
-        // Send to server
-        const response = await fetch('/api/timezone', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ timezone: browserTimezone }),
-        });
-        
-        if (response.ok) {
-          // Update local settings
-          setSettings({ ...settings, timezone: browserTimezone });
-        }
-      } catch (error) {
-        // Fail silently - timezone detection is not critical
-        console.debug('Timezone detection failed:', error);
-      }
-    };
+  // ── Barge-in ──────────────────────────────────────────────────────────────
 
-    void detectAndStoreTimezone();
-  }, [settings, setSettings]);
+  const handleBargein = useCallback(() => {
+    const targetId = lastVoiceBubbleIdRef.current;
+    if (!targetId) return;
 
+    setMessages(prev =>
+      prev.map(m =>
+        m.id === targetId ? { ...m, interrupted: true } : m
+      )
+    );
+  }, []);
 
-  useEffect(() => {
-    const intervalId = window.setInterval(() => {
-      void loadHistory();
-    }, POLL_INTERVAL_MS);
-
-    return () => window.clearInterval(intervalId);
-  }, [loadHistory]);
-
-  const canSubmit = input.trim().length > 0;
-  const inputPlaceholder = 'Type a message…';
-
-  const sendMessage = useCallback(
-    async (text: string) => {
-      const trimmed = text.trim();
-      if (!trimmed) return;
-
-      setError(null);
-      setIsWaitingForResponse(true);
-
-      // Optimistically add the user message immediately
-      const userMessage: ChatBubble = {
-        id: `user-${Date.now()}`,
-        role: 'user',
-        text: formatEscapeCharacters(trimmed),
-      };
-      setMessages(prev => {
-        const newMessages = [...prev, userMessage];
-        return newMessages;
-      });
-
-      try {
-        const res = await fetch('/api/chat', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            messages: [{ role: 'user', content: trimmed }],
-          }),
-        });
-
-        if (!(res.ok || res.status === 202)) {
-          const detail = await res.text();
-          throw new Error(detail || `Request failed (${res.status})`);
-        }
-      } catch (err: any) {
-        console.error('Failed to send message', err);
-        setError(err?.message || 'Failed to send message');
-        // Remove the optimistic message on error
-        setMessages(prev => prev.filter(msg => msg.id !== userMessage.id));
-        setIsWaitingForResponse(false);
-        throw err instanceof Error ? err : new Error('Failed to send message');
-      } finally {
-        // Poll until we get the assistant's response
-        let pollAttempts = 0;
-        const maxPollAttempts = 30; // Max 30 attempts (30 seconds)
-        
-        const pollForAssistantResponse = async () => {
-          pollAttempts++;
-          
-          try {
-            const res = await fetch('/api/chat/history', { cache: 'no-store' });
-            if (res.ok) {
-              const data = await res.json();
-              const currentMessages = toBubbles(data);
-              
-              // Check if the last message is from assistant and contains our user message
-              const lastMessage = currentMessages[currentMessages.length - 1];
-              const hasUserMessage = currentMessages.some(msg => msg.text === trimmed && msg.role === 'user');
-              const hasAssistantResponse = lastMessage?.role === 'assistant' && hasUserMessage;
-              
-              if (hasAssistantResponse) {
-                // We got the assistant response, update messages and stop loading
-                setMessages(currentMessages);
-                setIsWaitingForResponse(false);
-                return;
-              }
-            }
-          } catch (err) {
-            console.error('Error polling for response:', err);
-          }
-          
-          // Continue polling if we haven't exceeded max attempts
-          if (pollAttempts < maxPollAttempts) {
-            setTimeout(pollForAssistantResponse, 1000); // Poll every second
-          } else {
-            // Timeout - stop loading and update messages anyway
-            setIsWaitingForResponse(false);
-            await loadHistory();
-          }
-        };
-        
-        // Start polling after a brief delay
-        setTimeout(pollForAssistantResponse, 1000);
-      }
-    },
-    [loadHistory],
-  );
+  // ── Clear history ─────────────────────────────────────────────────────────
 
   const handleClearHistory = useCallback(async () => {
     try {
       const res = await fetch('/api/chat/history', { method: 'DELETE' });
-      if (!res.ok) {
-        console.error('Failed to clear chat history', res.statusText);
-        return;
-      }
+      if (!res.ok) { console.error('Failed to clear history', res.statusText); return; }
       setMessages([]);
+      lastVoiceBubbleIdRef.current = null;
     } catch (err) {
-      console.error('Failed to clear chat history', err);
+      console.error('Failed to clear history', err);
     }
-  }, [setMessages]);
+  }, []);
 
-  const triggerClearHistory = useCallback(() => {
-    void handleClearHistory();
-  }, [handleClearHistory]);
+  // ── Text submit ───────────────────────────────────────────────────────────
 
   const handleSubmit = useCallback(async () => {
-    if (!canSubmit) return;
+    if (!input.trim()) return;
     const value = input;
     setInput('');
-    try {
-      await sendMessage(value);
-    } catch {
-      setInput(value);
-    }
-  }, [canSubmit, input, sendMessage, setInput]);
+    try { await sendMessage(value); }
+    catch { setInput(value); }
+  }, [input, sendMessage]);
 
-  const handleInputChange = useCallback((value: string) => {
-    setInput(value);
-  }, [setInput]);
+  const canSubmit = input.trim().length > 0 && voiceState === 'idle';
 
-  const clearError = useCallback(() => setError(null), [setError]);
+  // ── Render ────────────────────────────────────────────────────────────────
 
   return (
     <main className="chat-bg min-h-screen p-4 sm:p-6">
       <div className="chat-wrap flex flex-col">
-        <ChatHeader onOpenSettings={openSettings} onClearHistory={triggerClearHistory} />
+        <ChatHeader
+          onOpenSettings={openSettings}
+          onClearHistory={() => void handleClearHistory()}
+        />
 
         <div className="card flex-1 overflow-hidden">
           <ChatMessages
@@ -238,22 +235,34 @@ export default function Page() {
             isWaitingForResponse={isWaitingForResponse}
             scrollContainerRef={scrollContainerRef}
             onScroll={handleScroll}
+            voiceState={voiceState}
+            liveTranscript={liveTranscript}
           />
 
           <div className="border-t border-gray-200 p-3">
-            {error && <ErrorBanner message={error} onDismiss={clearError} />}
+            {error && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
 
             <ChatInput
               value={input}
               canSubmit={canSubmit}
-              placeholder={inputPlaceholder}
-              onChange={handleInputChange}
+              placeholder={voiceState === 'idle' ? 'Type a message…' : 'Listening…'}
+              onChange={setInput}
               onSubmit={handleSubmit}
+              voiceWsUrl={VOICE_WS_URL}
+              onVoiceReply={handleVoiceReply}
+              onVoiceStateChange={setVoiceState}
+              onLiveTranscript={setLiveTranscript}
+              onBargein={handleBargein}
             />
           </div>
         </div>
 
-        <SettingsModal open={open} onClose={closeSettings} settings={settings} onSave={setSettings} />
+        <SettingsModal
+          open={open}
+          onClose={closeSettings}
+          settings={settings}
+          onSave={setSettings}
+        />
       </div>
     </main>
   );
